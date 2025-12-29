@@ -51,5 +51,7 @@ module.exports = {
     "^(.+)/utils\\.js$": "$1/utils.ts",
     "^(.+)/auth\\.js$": "$1/auth.ts",
     "^(.+)/logger\\.js$": "$1/logger.ts",
-  },
+    "^(.+)/organization-context\\.js$": "$1/organization-context.ts",
+    "^(.+)/tool-wrapper\\.js$": "$1/tool-wrapper.ts",
+    },
 };
