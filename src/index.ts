@@ -5,13 +5,10 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { getBearerHandler, WebApi } from "azure-devops-node-api";
 import yargs from "yargs";
 import { hideBin } from "yargs/helpers";
 
-import { createAuthenticator } from "./auth.js";
 import { logger } from "./logger.js";
-import { getOrgTenant } from "./org-tenants.js";
 //import { configurePrompts } from "./prompts.js";
 import { configureAllTools } from "./tools.js";
 import { UserAgentComposer } from "./useragent.js";
@@ -61,8 +58,8 @@ const argv = yargs(hideBin(process.argv))
   .parseSync();
 
 // Global exports for backward compatibility in single-org mode
-export let orgName: string = "";
-export let enabledDomains: Set<string> = new Set();
+export let orgName = "";
+export let enabledDomains = new Set();
 
 // Helper function to set global context for backward compatibility
 function setGlobalOrgContext(organization: string, domains: Set<string>) {
