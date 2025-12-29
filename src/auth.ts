@@ -122,4 +122,4 @@ function createAuthenticator(type: string, tenantId?: string): () => Promise<str
       };
   }
 }
-export { createAuthenticator };
+export { createAuthenticator, OAuthAuthenticator };

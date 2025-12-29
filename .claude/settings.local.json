@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc:*)",
+      "Bash(npm run build:*)",
+      "Bash(node test-switching.js:*)",
+      "Bash(node test-switching-simple.js:*)",
+      "Bash(node test-tools.js:*)",
+      "Bash(node:*)",
+      "Bash(timeout 5s node:*)",
+      "Bash(find:*)",
+      "Bash(npx tsc:*)"
+    ]
+  }
+}
