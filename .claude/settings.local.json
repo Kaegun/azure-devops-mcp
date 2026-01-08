@@ -9,7 +9,10 @@
       "Bash(node:*)",
       "Bash(timeout 5s node:*)",
       "Bash(find:*)",
-      "Bash(npx tsc:*)"
+      "Bash(npx tsc:*)",
+      "Bash(~/bin/sync-ado-to-wsl.sh:*)",
+      "Bash(timeout:*)",
+      "Bash(time ~/bin/sync-ado-to-wsl.sh:*)"
     ]
   }
 }
