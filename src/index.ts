@@ -135,7 +135,7 @@ async function initializeMultiOrgMode(orgManager: OrganizationManager, config: A
 }
 
 async function main() {
-  logger.info("🚀 Starting Azure DevOps MCP Server initialization (JU)", {
+  logger.info("🚀 Starting Azure DevOps MCP Server initialization", {
     version: packageVersion,
     nodeVersion: process.version,
     platform: process.platform,
