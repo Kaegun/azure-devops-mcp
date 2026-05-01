@@ -5,6 +5,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { getBearerHandler, getPersonalAccessTokenHandler, WebApi } from "azure-devops-node-api";
 import yargs from "yargs";
 import { hideBin } from "yargs/helpers";
 
@@ -46,7 +47,7 @@ const argv = yargs(hideBin(process.argv))
     alias: "a",
     describe: "Type of authentication to use",
     type: "string",
-    choices: ["interactive", "azcli", "env", "envvar"],
+    choices: ["interactive", "azcli", "env", "envvar", "pat"],
     default: defaultAuthenticationType,
   })
   .option("tenant", {
@@ -59,12 +60,31 @@ const argv = yargs(hideBin(process.argv))
 
 // Global exports for backward compatibility in single-org mode
 export let orgName = "";
-export let enabledDomains = new Set();
+export let enabledDomains = new Set<string>();
 
 // Helper function to set global context for backward compatibility
 function setGlobalOrgContext(organization: string, domains: Set<string>) {
   orgName = organization;
   enabledDomains = domains;
+}
+
+function getAzureDevOpsClient(orgManager: OrganizationManager, getAzureDevOpsToken: () => Promise<string>, userAgentComposer: UserAgentComposer, authType: string): () => Promise<WebApi> {
+  return async () => {
+    const context = orgManager.getCurrentContext();
+    if (!context) {
+      throw new Error("No organization context selected");
+    }
+    const accessToken = await getAzureDevOpsToken();
+    // For pat, accessToken is base64("{email}:{token}"). Decode to extract the token part,
+    // since getPersonalAccessTokenHandler prepends ":" internally and just needs the raw token.
+    const authHandler = authType === "pat" ? getPersonalAccessTokenHandler(Buffer.from(accessToken, "base64").toString("utf8").split(":").slice(1).join(":")) : getBearerHandler(accessToken);
+    const connection = new WebApi(context.orgUrl, authHandler, undefined, {
+      productName: "AzureDevOps.MCP",
+      productVersion: packageVersion,
+      userAgent: userAgentComposer.userAgent,
+    });
+    return connection;
+  };
 }
 
 /**
@@ -189,11 +209,36 @@ async function main() {
     isCodespace: isGitHubCodespaceEnv(),
   });
 
+  // Token provider that always resolves against the currently-selected org
+  const authenticator: () => Promise<string> = async () => {
+    const context = orgManager.getCurrentContext();
+    if (!context) {
+      throw new Error("No organization context selected");
+    }
+    return context.authenticator();
+  };
+
+  if (argv.authentication === "pat") {
+    const basicValue = await authenticator();
+    // basicValue is already base64("{email}:{token}") — use it directly in the Authorization header
+    const _originalFetch = globalThis.fetch;
+    globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.headers) {
+        const headers = new Headers(init.headers as HeadersInit);
+        if (headers.get("Authorization")?.startsWith("Bearer ")) {
+          headers.set("Authorization", `Basic ${basicValue}`);
+          init = { ...init, headers };
+        }
+      }
+      return _originalFetch(input, init);
+    };
+    logger.debug("PAT mode: global fetch interceptor installed to rewrite Bearer -> Basic auth headers");
+  }
+
   // removing prompts untill further notice
   // configurePrompts(server);
 
-  // Configure all tools with organization manager
-  configureAllTools(server, orgManager);
+  configureAllTools(server, authenticator, getAzureDevOpsClient(orgManager, authenticator, userAgentComposer, argv.authentication), () => userAgentComposer.userAgent, enabledDomains, orgManager);
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

@@ -5,11 +5,17 @@ import { describe, expect, it } from "@jest/globals";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { configureWorkItemTools } from "../../../src/tools/work-items";
 import { WebApi } from "azure-devops-node-api";
+import { Readable } from "stream";
+import * as fs from "fs";
+import * as path from "path";
 import { QueryExpand } from "azure-devops-node-api/interfaces/WorkItemTrackingInterfaces.js";
+
+jest.mock("fs");
 import {
   _mockBacklogs,
   _mockQuery,
   _mockQueryResults,
+  _mockWiqlQueryResults,
   _mockWorkItem,
   _mockWorkItemComment,
   _mockWorkItemComments,
@@ -41,11 +47,14 @@ interface WorkItemTrackingApiMock {
   getWorkItemType: jest.Mock;
   getQuery: jest.Mock;
   queryById: jest.Mock;
+  queryByWiql: jest.Mock;
+  getAttachmentContent: jest.Mock;
 }
 
 interface MockConnection {
   getWorkApi: jest.Mock;
   getWorkItemTrackingApi: jest.Mock;
+  getCoreApi: jest.Mock;
   serverUrl?: string;
 }
 
@@ -59,7 +68,7 @@ describe("configureWorkItemTools", () => {
   let mockWorkItemTrackingApi: WorkItemTrackingApiMock;
 
   beforeEach(() => {
-    server = { tool: jest.fn() } as unknown as McpServer;
+    server = { tool: jest.fn(), server: { elicitInput: jest.fn() } } as unknown as McpServer;
     tokenProvider = jest.fn();
 
     mockWorkApi = {
@@ -81,11 +90,14 @@ describe("configureWorkItemTools", () => {
       getWorkItemType: jest.fn(),
       getQuery: jest.fn(),
       queryById: jest.fn(),
+      queryByWiql: jest.fn(),
+      getAttachmentContent: jest.fn(),
     };
 
     mockConnection = {
       getWorkApi: jest.fn().mockResolvedValue(mockWorkApi),
       getWorkItemTrackingApi: jest.fn().mockResolvedValue(mockWorkItemTrackingApi),
+      getCoreApi: jest.fn().mockResolvedValue({ getProjects: jest.fn() }),
     };
 
     connectionProvider = jest.fn().mockResolvedValue(mockConnection);
@@ -680,6 +692,82 @@ describe("configureWorkItemTools", () => {
 
       expect(result.content[0].text).toBe(JSON.stringify([_mockWorkItem], null, 2));
     });
+
+    it("should call getWorkItem with fields and no expand when fields are provided but expand is empty", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_get_work_item");
+
+      if (!call) throw new Error("wit_get_work_item tool not registered");
+      const [, , , handler] = call;
+
+      (mockWorkItemTrackingApi.getWorkItem as jest.Mock).mockResolvedValue(_mockWorkItem);
+
+      const params = {
+        id: 12,
+        fields: ["System.Title", "System.State"],
+        asOf: undefined,
+        expand: undefined,
+        project: "Contoso",
+      };
+
+      const result = await handler(params);
+
+      expect(mockWorkItemTrackingApi.getWorkItem).toHaveBeenCalledWith(params.id, params.fields, params.asOf, undefined, params.project);
+
+      expect(result.content[0].text).toBe(JSON.stringify(_mockWorkItem, null, 2));
+    });
+
+    it("should call getWorkItem with expand and no fields when expand is provided but fields are empty", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_get_work_item");
+
+      if (!call) throw new Error("wit_get_work_item tool not registered");
+      const [, , , handler] = call;
+
+      (mockWorkItemTrackingApi.getWorkItem as jest.Mock).mockResolvedValue(_mockWorkItem);
+
+      const params = {
+        id: 12,
+        fields: undefined,
+        asOf: undefined,
+        expand: "relations",
+        project: "Contoso",
+      };
+
+      const result = await handler(params);
+
+      expect(mockWorkItemTrackingApi.getWorkItem).toHaveBeenCalledWith(params.id, params.fields, params.asOf, "relations", params.project);
+
+      expect(result.content[0].text).toBe(JSON.stringify(_mockWorkItem, null, 2));
+    });
+
+    it("should override expand to 'none' when both fields and expand are provided", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_get_work_item");
+
+      if (!call) throw new Error("wit_get_work_item tool not registered");
+      const [, , , handler] = call;
+
+      (mockWorkItemTrackingApi.getWorkItem as jest.Mock).mockResolvedValue(_mockWorkItem);
+
+      const params = {
+        id: 12,
+        fields: ["System.Title", "System.State"],
+        asOf: undefined,
+        expand: "relations",
+        project: "Contoso",
+      };
+
+      const result = await handler(params);
+
+      // expand should be overridden to "none" because fields takes precedence
+      expect(mockWorkItemTrackingApi.getWorkItem).toHaveBeenCalledWith(params.id, params.fields, params.asOf, "none", params.project);
+
+      expect(result.content[0].text).toBe(JSON.stringify(_mockWorkItem, null, 2));
+    });
   });
 
   describe("list_work_item_comments tool", () => {
@@ -735,7 +823,7 @@ describe("configureWorkItemTools", () => {
       const result = await handler(params);
 
       expect(mockFetch).toHaveBeenCalledWith(
-        "https://dev.azure.com/contoso/Contoso/_apis/wit/workItems/299/comments?format=1&api-version=7.2-preview.4",
+        "https://dev.azure.com/contoso/Contoso/_apis/wit/workItems/299/comments?format=0&api-version=7.2-preview.4",
         expect.objectContaining({
           method: "POST",
           headers: expect.objectContaining({
@@ -770,7 +858,7 @@ describe("configureWorkItemTools", () => {
         comment: "hello world!",
         project: "Contoso",
         workItemId: 299,
-        format: "markdown",
+        format: "Markdown",
       };
 
       const result = await handler(params);
@@ -787,6 +875,23 @@ describe("configureWorkItemTools", () => {
       );
 
       expect(result.content[0].text).toBe(JSON.stringify(_mockWorkItemComment));
+    });
+
+    it("should call Add Work Item Comments API with format=1 when format is Html", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_add_work_item_comment");
+      if (!call) throw new Error("wit_add_work_item_comment tool not registered");
+      const [, , , handler] = call;
+
+      mockConnection.serverUrl = "https://dev.azure.com/contoso";
+      (tokenProvider as jest.Mock).mockResolvedValue("fake-token");
+      const mockFetch = jest.fn().mockResolvedValue({ ok: true, text: () => Promise.resolve(JSON.stringify(_mockWorkItemComment)) });
+      global.fetch = mockFetch;
+
+      await handler({ comment: "hello world!", project: "Contoso", workItemId: 299, format: "Html" });
+
+      expect(mockFetch).toHaveBeenCalledWith("https://dev.azure.com/contoso/Contoso/_apis/wit/workItems/299/comments?format=1&api-version=7.2-preview.4", expect.objectContaining({ method: "POST" }));
     });
 
     it("should handle fetch failure response", async () => {
@@ -817,6 +922,150 @@ describe("configureWorkItemTools", () => {
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("Error adding work item comment");
       expect(result.content[0].text).toContain("Failed to add a work item comment: Not Found");
+    });
+
+    it("should encode the project parameter to prevent URL path injection", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_add_work_item_comment");
+      if (!call) throw new Error("wit_add_work_item_comment tool not registered");
+      const [, , , handler] = call;
+
+      mockConnection.serverUrl = "https://dev.azure.com/contoso";
+      (tokenProvider as jest.Mock).mockResolvedValue("fake-token");
+
+      const mockFetch = jest.fn().mockResolvedValue({
+        ok: true,
+        text: () => Promise.resolve(JSON.stringify({ id: 1, text: "comment" })),
+      });
+      global.fetch = mockFetch;
+
+      const maliciousProject = "../../_apis/hooks/subscriptions";
+      const params = {
+        comment: "attacker-controlled body content",
+        project: maliciousProject,
+        workItemId: 1,
+      };
+
+      await handler(params);
+
+      const calledUrl = mockFetch.mock.calls[0][0] as string;
+      // The project must be encoded in the URL to prevent path traversal
+      expect(calledUrl).toContain(encodeURIComponent(maliciousProject));
+      expect(calledUrl).not.toContain("../../");
+    });
+  });
+
+  describe("update_work_item_comment tool", () => {
+    it("should update a work item comment", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_update_work_item_comment");
+
+      if (!call) throw new Error("wit_update_work_item_comment tool not registered");
+      const [, , , handler] = call;
+
+      mockConnection.serverUrl = "https://dev.azure.com/contoso";
+      (tokenProvider as jest.Mock).mockResolvedValue("fake-token");
+
+      const mockFetch = jest.fn().mockResolvedValue({
+        ok: true,
+        text: () =>
+          Promise.resolve(
+            JSON.stringify({
+              workItemId: 42,
+              id: 100,
+              version: 2,
+              text: "Updated comment text",
+            })
+          ),
+      });
+      global.fetch = mockFetch;
+
+      const params = {
+        project: "TestProject",
+        workItemId: 42,
+        commentId: 100,
+        text: "Updated comment text",
+      };
+
+      const result = await handler(params);
+
+      expect(mockFetch).toHaveBeenCalledWith(
+        "https://dev.azure.com/contoso/TestProject/_apis/wit/workItems/42/comments/100?format=0&api-version=7.2-preview.4",
+        expect.objectContaining({
+          method: "PATCH",
+          headers: expect.objectContaining({
+            "Authorization": "Bearer fake-token",
+            "Content-Type": "application/json",
+          }),
+        })
+      );
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.text).toBe("Updated comment text");
+    });
+
+    it("should handle update work item comment failure", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_update_work_item_comment");
+
+      if (!call) throw new Error("wit_update_work_item_comment tool not registered");
+      const [, , , handler] = call;
+
+      mockConnection.serverUrl = "https://dev.azure.com/contoso";
+      (tokenProvider as jest.Mock).mockResolvedValue("fake-token");
+
+      const mockFetch = jest.fn().mockResolvedValue({
+        ok: false,
+        statusText: "Not Found",
+      });
+      global.fetch = mockFetch;
+
+      const params = {
+        project: "TestProject",
+        workItemId: 42,
+        commentId: 999,
+        text: "This should fail",
+      };
+
+      const result = await handler(params);
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("Error updating work item comment");
+      expect(result.content[0].text).toContain("Failed to update work item comment: Not Found");
+    });
+
+    it("should encode the project parameter to prevent URL path injection", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_update_work_item_comment");
+      if (!call) throw new Error("wit_update_work_item_comment tool not registered");
+      const [, , , handler] = call;
+
+      mockConnection.serverUrl = "https://dev.azure.com/contoso";
+      (tokenProvider as jest.Mock).mockResolvedValue("fake-token");
+
+      const mockFetch = jest.fn().mockResolvedValue({
+        ok: true,
+        text: () => Promise.resolve(JSON.stringify({ id: 1, text: "updated" })),
+      });
+      global.fetch = mockFetch;
+
+      const maliciousProject = "../../_apis/hooks/subscriptions/hookId";
+      const params = {
+        project: maliciousProject,
+        workItemId: 1,
+        commentId: 1,
+        text: "attacker-controlled body",
+      };
+
+      await handler(params);
+
+      const calledUrl = mockFetch.mock.calls[0][0] as string;
+      // The project must be encoded in the URL to prevent path traversal
+      expect(calledUrl).toContain(encodeURIComponent(maliciousProject));
+      expect(calledUrl).not.toContain("../../");
     });
   });
 
@@ -2161,6 +2410,48 @@ describe("configureWorkItemTools", () => {
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toBe("Error unlinking work item: Unknown error occurred");
     });
+
+    describe("type + url matching", () => {
+      const artifactUrl = "vstfs:///Git/Ref/project%2Frepo%2FGBmain";
+      const relatedUrl = "https://dev.azure.com/contoso/_apis/wit/workItems/2";
+      const relations = [
+        { rel: "ArtifactLink", url: artifactUrl, attributes: { name: "Branch" } },
+        { rel: "System.LinkTypes.Related", url: relatedUrl, attributes: { isLocked: false, name: "Related" } },
+      ];
+
+      const getUnlinkHandler = () => {
+        configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+        const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_work_item_unlink");
+        if (!call) throw new Error("wit_work_item_unlink tool not registered");
+        return call[3];
+      };
+
+      it.each([
+        { name: "type=related + ArtifactLink url (type bypass)", type: "related", url: artifactUrl },
+        { name: "type=child + ArtifactLink url (type bypass)", type: "child", url: artifactUrl },
+      ])("should NOT remove a relation when url matches but type does not ($name)", async ({ type, url }) => {
+        const handler = getUnlinkHandler();
+        (mockWorkItemTrackingApi.getWorkItem as jest.Mock).mockResolvedValue({ id: 1, relations });
+
+        const result = await handler({ project: "TestProject", id: 1, type, url });
+
+        expect(mockWorkItemTrackingApi.updateWorkItem).not.toHaveBeenCalled();
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain("No matching relations found");
+      });
+
+      it("should remove a relation when both url and type match", async () => {
+        const handler = getUnlinkHandler();
+        (mockWorkItemTrackingApi.getWorkItem as jest.Mock).mockResolvedValue({ id: 1, relations });
+        (mockWorkItemTrackingApi.updateWorkItem as jest.Mock).mockResolvedValue({ id: 1, rev: 10 });
+
+        const result = await handler({ project: "TestProject", id: 1, type: "related", url: relatedUrl });
+
+        expect(mockWorkItemTrackingApi.updateWorkItem).toHaveBeenCalledWith(null, [{ op: "remove", path: "/relations/1" }], 1, "TestProject");
+        expect(result.isError).toBe(false);
+        expect(result.content[0].text).toContain("Removed 1 link(s) of type 'related':");
+      });
+    });
   });
 
   // Add error handling tests for existing tools
@@ -2549,6 +2840,72 @@ describe("configureWorkItemTools", () => {
 
       expect(result.content[0].text).toBe("Error creating child work items: Unknown error occurred");
       expect(result.isError).toBe(true);
+    });
+
+    it("should encode the project parameter in batch request URI to prevent path injection", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_add_child_work_items");
+      if (!call) throw new Error("wit_add_child_work_items tool not registered");
+      const [, , , handler] = call;
+
+      mockConnection.serverUrl = "https://dev.azure.com/contoso";
+      (tokenProvider as jest.Mock).mockResolvedValue("fake-token");
+
+      const mockFetch = jest.fn().mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve({ responses: [{ body: { id: 123 } }] }),
+      });
+      global.fetch = mockFetch;
+
+      const maliciousProject = "../../_apis/audit/streams";
+      const params = {
+        parentId: 1,
+        project: maliciousProject,
+        workItemType: "Task",
+        items: [{ title: "Test", description: "Test" }],
+      };
+
+      await handler(params);
+
+      const calledBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+      const batchUri = calledBody[0].uri as string;
+      // The project must be encoded in the batch URI to prevent path traversal
+      expect(batchUri).toContain(encodeURIComponent(maliciousProject));
+      expect(batchUri).not.toContain("../../");
+    });
+
+    it("should encode the workItemType parameter in batch request URI to prevent path injection", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_add_child_work_items");
+      if (!call) throw new Error("wit_add_child_work_items tool not registered");
+      const [, , , handler] = call;
+
+      mockConnection.serverUrl = "https://dev.azure.com/contoso";
+      (tokenProvider as jest.Mock).mockResolvedValue("fake-token");
+
+      const mockFetch = jest.fn().mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve({ responses: [{ body: { id: 123 } }] }),
+      });
+      global.fetch = mockFetch;
+
+      const maliciousType = "Task/../../_apis/audit/streams";
+      const params = {
+        parentId: 1,
+        project: "ValidProject",
+        workItemType: maliciousType,
+        items: [{ title: "Test", description: "Test" }],
+      };
+
+      await handler(params);
+
+      const calledBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+      const batchUri = calledBody[0].uri as string;
+      // The workItemType must be encoded in the batch URI to prevent path traversal
+      expect(batchUri).toContain(encodeURIComponent(maliciousType));
+      expect(batchUri).not.toContain("Task/../../");
     });
   });
 
@@ -3442,6 +3799,1210 @@ describe("configureWorkItemTools", () => {
         expect(result.isError).toBe(true);
         expect(result.content[0].text).toBe("Work item update failed");
       });
+    });
+  });
+
+  describe("wit_get_work_item_attachment tool", () => {
+    function makeReadableStream(data: Buffer): NodeJS.ReadableStream {
+      const stream = new Readable();
+      stream.push(data);
+      stream.push(null);
+      return stream;
+    }
+
+    it("should return attachment content as a base64 image resource", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_get_work_item_attachment");
+      if (!call) throw new Error("wit_get_work_item_attachment tool not registered");
+      const [, , , handler] = call;
+
+      const fakeImageData = Buffer.from("fake-png-bytes");
+      mockWorkItemTrackingApi.getAttachmentContent.mockResolvedValue(makeReadableStream(fakeImageData));
+
+      const params = {
+        project: "TestProject",
+        attachmentId: "12341234-1234-1234-1234-123412341234",
+        fileName: "screenshot.png",
+      };
+
+      const result = await handler(params);
+
+      expect(mockWorkItemTrackingApi.getAttachmentContent).toHaveBeenCalledWith(params.attachmentId, params.fileName, params.project);
+
+      const base64Data = fakeImageData.toString("base64");
+      expect(result.content[0].type).toBe("resource");
+      expect(result.content[0].resource.mimeType).toBe("image/png");
+      expect(result.content[0].resource.blob).toBe(base64Data);
+      expect(result.content[0].resource.uri).toBe(`data:image/png;base64,${base64Data}`);
+    });
+
+    it("should use application/octet-stream for an unknown file extension", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_get_work_item_attachment");
+      if (!call) throw new Error("wit_get_work_item_attachment tool not registered");
+      const [, , , handler] = call;
+
+      const fakeData = Buffer.from("binary-data");
+      mockWorkItemTrackingApi.getAttachmentContent.mockResolvedValue(makeReadableStream(fakeData));
+
+      const result = await handler({
+        project: "TestProject",
+        attachmentId: "12341234-1234-1234-1234-123412341234",
+        fileName: "data.xyz",
+      });
+
+      expect(result.content[0].resource.mimeType).toBe("application/octet-stream");
+    });
+
+    it("should use application/octet-stream when fileName is omitted", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_get_work_item_attachment");
+      if (!call) throw new Error("wit_get_work_item_attachment tool not registered");
+      const [, , , handler] = call;
+
+      const fakeData = Buffer.from("binary-data");
+      mockWorkItemTrackingApi.getAttachmentContent.mockResolvedValue(makeReadableStream(fakeData));
+
+      const result = await handler({
+        project: "TestProject",
+        attachmentId: "12341234-1234-1234-1234-123412341234",
+      });
+
+      expect(result.content[0].resource.mimeType).toBe("application/octet-stream");
+    });
+
+    it("should return an error when getAttachmentContent rejects", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_get_work_item_attachment");
+      if (!call) throw new Error("wit_get_work_item_attachment tool not registered");
+      const [, , , handler] = call;
+
+      mockWorkItemTrackingApi.getAttachmentContent.mockRejectedValue(new Error("Not found"));
+
+      const result = await handler({
+        project: "TestProject",
+        attachmentId: "12341234-1234-1234-1234-123412341234",
+        fileName: "screenshot.png",
+      });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe("Error retrieving work item attachment: Not found");
+    });
+
+    it("should save file to disk and return path text when savePath is provided", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_get_work_item_attachment");
+      if (!call) throw new Error("wit_get_work_item_attachment tool not registered");
+      const [, , , handler] = call;
+
+      const fakeData = Buffer.from("fake-png-bytes");
+      mockWorkItemTrackingApi.getAttachmentContent.mockResolvedValue(makeReadableStream(fakeData));
+      const writeFileSyncMock = jest.spyOn(fs, "writeFileSync").mockImplementation(() => undefined);
+
+      const params = {
+        project: "TestProject",
+        attachmentId: "12341234-1234-1234-1234-123412341234",
+        fileName: "screenshot.png",
+        savePath: "downloads/attachments",
+      };
+
+      const result = await handler(params);
+
+      const expectedPath = path.join("downloads/attachments", "screenshot.png");
+      expect(writeFileSyncMock).toHaveBeenCalledWith(expectedPath, fakeData);
+      expect(result.content[0].type).toBe("text");
+      expect(result.content[0].text).toBe(`Attachment saved to: ${expectedPath}`);
+
+      writeFileSyncMock.mockRestore();
+    });
+
+    it("should use attachmentId as filename when savePath is provided but fileName is omitted", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_get_work_item_attachment");
+      if (!call) throw new Error("wit_get_work_item_attachment tool not registered");
+      const [, , , handler] = call;
+
+      const fakeData = Buffer.from("binary-data");
+      mockWorkItemTrackingApi.getAttachmentContent.mockResolvedValue(makeReadableStream(fakeData));
+      const writeFileSyncMock = jest.spyOn(fs, "writeFileSync").mockImplementation(() => undefined);
+
+      const attachmentId = "12341234-1234-1234-1234-123412341234";
+      const params = {
+        project: "TestProject",
+        attachmentId,
+        savePath: "downloads/attachments",
+      };
+
+      const result = await handler(params);
+
+      const expectedPath = path.join("downloads/attachments", attachmentId);
+      expect(writeFileSyncMock).toHaveBeenCalledWith(expectedPath, fakeData);
+      expect(result.content[0].text).toBe(`Attachment saved to: ${expectedPath}`);
+
+      writeFileSyncMock.mockRestore();
+    });
+
+    it("should throw an error if the file already exists at the savePath", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_get_work_item_attachment");
+      if (!call) throw new Error("wit_get_work_item_attachment tool not registered");
+      const [, , , handler] = call;
+
+      const fakeData = Buffer.from("fake-png-bytes");
+      mockWorkItemTrackingApi.getAttachmentContent.mockResolvedValue(makeReadableStream(fakeData));
+      jest.spyOn(fs, "existsSync").mockReturnValue(true);
+
+      const params = {
+        project: "TestProject",
+        attachmentId: "12341234-1234-1234-1234-123412341234",
+        fileName: "screenshot.png",
+        savePath: "downloads/attachments",
+      };
+
+      const expectedPath = path.join("downloads/attachments", "screenshot.png");
+      const result = await handler(params);
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe(`Error retrieving work item attachment: File already exists: ${expectedPath}`);
+
+      jest.restoreAllMocks();
+    });
+
+    it("should return text content for markdown files when savePath is not provided", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_get_work_item_attachment");
+      if (!call) throw new Error("wit_get_work_item_attachment tool not registered");
+      const [, , , handler] = call;
+
+      const markdownContent = "# Hello\n\nThis is a markdown file.";
+      const fakeData = Buffer.from(markdownContent, "utf-8");
+      mockWorkItemTrackingApi.getAttachmentContent.mockResolvedValue(makeReadableStream(fakeData));
+
+      const result = await handler({
+        project: "TestProject",
+        attachmentId: "12341234-1234-1234-1234-123412341234",
+        fileName: "notes.md",
+      });
+
+      expect(result.content[0].type).toBe("text");
+      expect(result.content[0].text).toBe(markdownContent);
+    });
+
+    it("should return text content for plain text files when savePath is not provided", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_get_work_item_attachment");
+      if (!call) throw new Error("wit_get_work_item_attachment tool not registered");
+      const [, , , handler] = call;
+
+      const textContent = "Hello, world!";
+      const fakeData = Buffer.from(textContent, "utf-8");
+      mockWorkItemTrackingApi.getAttachmentContent.mockResolvedValue(makeReadableStream(fakeData));
+
+      const result = await handler({
+        project: "TestProject",
+        attachmentId: "12341234-1234-1234-1234-123412341234",
+        fileName: "readme.txt",
+      });
+
+      expect(result.content[0].type).toBe("text");
+      expect(result.content[0].text).toBe(textContent);
+    });
+
+    it("should reject savePath with a Unix absolute path", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_get_work_item_attachment");
+      if (!call) throw new Error("wit_get_work_item_attachment tool not registered");
+      const [, , , handler] = call;
+
+      const params = {
+        project: "TestProject",
+        attachmentId: "12341234-1234-1234-1234-123412341234",
+        fileName: "screenshot.png",
+        savePath: "/tmp/attachments",
+      };
+
+      await expect(handler(params)).rejects.toThrow("Invalid savePath: absolute paths and path traversals are not allowed.");
+      expect(connectionProvider).not.toHaveBeenCalled();
+    });
+
+    it("should reject savePath with a Windows absolute path", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_get_work_item_attachment");
+      if (!call) throw new Error("wit_get_work_item_attachment tool not registered");
+      const [, , , handler] = call;
+
+      const params = {
+        project: "TestProject",
+        attachmentId: "12341234-1234-1234-1234-123412341234",
+        fileName: "screenshot.png",
+        savePath: "C:\\temp\\attachments",
+      };
+
+      await expect(handler(params)).rejects.toThrow("Invalid savePath: absolute paths and path traversals are not allowed.");
+      expect(connectionProvider).not.toHaveBeenCalled();
+    });
+
+    it("should reject savePath with path traversal segments", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_get_work_item_attachment");
+      if (!call) throw new Error("wit_get_work_item_attachment tool not registered");
+      const [, , , handler] = call;
+
+      const params = {
+        project: "TestProject",
+        attachmentId: "12341234-1234-1234-1234-123412341234",
+        fileName: "screenshot.png",
+        savePath: "../../etc",
+      };
+
+      await expect(handler(params)).rejects.toThrow("Invalid savePath: absolute paths and path traversals are not allowed.");
+      expect(connectionProvider).not.toHaveBeenCalled();
+    });
+
+    it("should reject savePath with a Windows drive-relative path", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_get_work_item_attachment");
+      if (!call) throw new Error("wit_get_work_item_attachment tool not registered");
+      const [, , , handler] = call;
+
+      const params = {
+        project: "TestProject",
+        attachmentId: "12341234-1234-1234-1234-123412341234",
+        fileName: "screenshot.png",
+        savePath: "D:attachments",
+      };
+
+      await expect(handler(params)).rejects.toThrow("Invalid savePath: absolute paths and path traversals are not allowed.");
+      expect(connectionProvider).not.toHaveBeenCalled();
+    });
+
+    it("should reject fileName with path traversal segments", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_get_work_item_attachment");
+      if (!call) throw new Error("wit_get_work_item_attachment tool not registered");
+      const [, , , handler] = call;
+
+      const params = {
+        project: "TestProject",
+        attachmentId: "12341234-1234-1234-1234-123412341234",
+        fileName: "../../etc/passwd",
+        savePath: "downloads",
+      };
+
+      await expect(handler(params)).rejects.toThrow("Invalid fileName: path traversal is not allowed.");
+      expect(connectionProvider).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("query_by_wiql tool", () => {
+    it("should call queryByWiql with correct params when project is provided", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_query_by_wiql");
+      if (!call) throw new Error("wit_query_by_wiql tool not registered");
+      const [, , , handler] = call;
+
+      (mockWorkItemTrackingApi.queryByWiql as jest.Mock).mockResolvedValue(_mockWiqlQueryResults);
+
+      const params = {
+        wiql: "SELECT [System.Id], [System.Title] FROM WorkItems WHERE [System.TeamProject] = @project",
+        project: "Contoso",
+        team: undefined,
+        timePrecision: undefined,
+        top: 50,
+      };
+
+      const result = await handler(params);
+
+      expect(mockWorkItemTrackingApi.queryByWiql).toHaveBeenCalledWith({ query: params.wiql }, { project: params.project, team: undefined }, undefined, 50);
+      expect(result.content[0].text).toContain("UNTRUSTED");
+      expect(result.content[0].text).toContain(JSON.stringify(_mockWiqlQueryResults, null, 2));
+    });
+
+    it("should call queryByWiql with all optional params when provided", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_query_by_wiql");
+      if (!call) throw new Error("wit_query_by_wiql tool not registered");
+      const [, , , handler] = call;
+
+      (mockWorkItemTrackingApi.queryByWiql as jest.Mock).mockResolvedValue(_mockWiqlQueryResults);
+
+      const params = {
+        wiql: "SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = @project AND [System.State] = 'Active'",
+        project: "Contoso",
+        team: "Fabrikam",
+        timePrecision: true,
+        top: 100,
+      };
+
+      const result = await handler(params);
+
+      expect(mockWorkItemTrackingApi.queryByWiql).toHaveBeenCalledWith({ query: params.wiql }, { project: "Contoso", team: "Fabrikam" }, true, 100);
+      expect(result.content[0].text).toContain("UNTRUSTED");
+      expect(result.content[0].text).toContain(JSON.stringify(_mockWiqlQueryResults, null, 2));
+    });
+
+    it("should elicit project when project is not provided and user accepts", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_query_by_wiql");
+      if (!call) throw new Error("wit_query_by_wiql tool not registered");
+      const [, , , handler] = call;
+
+      const mockCoreApi = { getProjects: jest.fn().mockResolvedValue([{ id: "proj-1", name: "Contoso" }]) };
+      (mockConnection.getCoreApi as jest.Mock).mockResolvedValue(mockCoreApi);
+
+      ((server as unknown as { server: { elicitInput: jest.Mock } }).server.elicitInput as jest.Mock).mockResolvedValue({
+        action: "accept",
+        content: { project: "Contoso" },
+      });
+
+      (mockWorkItemTrackingApi.queryByWiql as jest.Mock).mockResolvedValue(_mockWiqlQueryResults);
+
+      const params = {
+        wiql: "SELECT [System.Id] FROM WorkItems",
+        project: undefined,
+        team: undefined,
+        timePrecision: undefined,
+        top: 50,
+      };
+
+      const result = await handler(params);
+
+      expect((server as unknown as { server: { elicitInput: jest.Mock } }).server.elicitInput).toHaveBeenCalled();
+      expect(mockWorkItemTrackingApi.queryByWiql).toHaveBeenCalledWith({ query: params.wiql }, { project: "Contoso", team: undefined }, undefined, 50);
+      expect(result.content[0].text).toContain("UNTRUSTED");
+      expect(result.content[0].text).toContain(JSON.stringify(_mockWiqlQueryResults, null, 2));
+    });
+
+    it("should return cancellation message when user declines project elicitation", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_query_by_wiql");
+      if (!call) throw new Error("wit_query_by_wiql tool not registered");
+      const [, , , handler] = call;
+
+      const mockCoreApi = { getProjects: jest.fn().mockResolvedValue([{ id: "proj-1", name: "Contoso" }]) };
+      (mockConnection.getCoreApi as jest.Mock).mockResolvedValue(mockCoreApi);
+
+      ((server as unknown as { server: { elicitInput: jest.Mock } }).server.elicitInput as jest.Mock).mockResolvedValue({
+        action: "decline",
+      });
+
+      const params = {
+        wiql: "SELECT [System.Id] FROM WorkItems",
+        project: undefined,
+        team: undefined,
+        timePrecision: undefined,
+        top: 50,
+      };
+
+      const result = await handler(params);
+
+      expect(mockWorkItemTrackingApi.queryByWiql).not.toHaveBeenCalled();
+      expect(result.content[0].text).toBe("Project selection cancelled.");
+    });
+
+    it("should return an error when queryByWiql throws", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_query_by_wiql");
+      if (!call) throw new Error("wit_query_by_wiql tool not registered");
+      const [, , , handler] = call;
+
+      (mockWorkItemTrackingApi.queryByWiql as jest.Mock).mockRejectedValue(new Error("WIQL syntax error"));
+
+      const params = {
+        wiql: "INVALID WIQL",
+        project: "Contoso",
+        team: undefined,
+        timePrecision: undefined,
+        top: 50,
+      };
+
+      const result = await handler(params);
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe("Error executing WIQL query: WIQL syntax error");
+    });
+  });
+
+  describe("elicitation decline paths", () => {
+    // Helper to set up getCoreApi mock for elicitation
+    function setupElicitMocks(elicitAction: "accept" | "decline", selectedProject = "Contoso", selectedTeam = "Fabrikam") {
+      (mockConnection.getCoreApi as jest.Mock).mockResolvedValue({
+        getProjects: jest.fn().mockResolvedValue([{ id: "proj-1", name: selectedProject }]),
+        getTeams: jest.fn().mockResolvedValue([{ id: "team-1", name: selectedTeam }]),
+      });
+      ((server as unknown as { server: { elicitInput: jest.Mock } }).server.elicitInput as jest.Mock).mockResolvedValue(
+        elicitAction === "accept" ? { action: "accept", content: { project: selectedProject, team: selectedTeam } } : { action: "decline" }
+      );
+    }
+
+    it("list_backlogs: should return elicitation response when project selection is declined", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_list_backlogs");
+      if (!call) throw new Error("wit_list_backlogs not registered");
+      const [, , , handler] = call;
+
+      setupElicitMocks("decline");
+
+      const result = await handler({ team: "Fabrikam" });
+      expect(result.content[0].text).toBe("Project selection cancelled.");
+    });
+
+    it("list_backlogs: should use elicited project and return elicitation response when team selection is declined", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_list_backlogs");
+      if (!call) throw new Error("wit_list_backlogs not registered");
+      const [, , , handler] = call;
+
+      setupElicitMocks("decline");
+
+      const result = await handler({ project: "Contoso" });
+      expect(result.content[0].text).toBe("Team selection cancelled.");
+    });
+
+    it("list_backlog_work_items: should return elicitation response when project selection is declined", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_list_backlog_work_items");
+      if (!call) throw new Error("wit_list_backlog_work_items not registered");
+      const [, , , handler] = call;
+
+      setupElicitMocks("decline");
+
+      const result = await handler({ team: "Fabrikam", backlogId: "Microsoft.FeatureCategory" });
+      expect(result.content[0].text).toBe("Project selection cancelled.");
+    });
+
+    it("list_backlog_work_items: should return elicitation response when team selection is declined", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_list_backlog_work_items");
+      if (!call) throw new Error("wit_list_backlog_work_items not registered");
+      const [, , , handler] = call;
+
+      setupElicitMocks("decline");
+
+      const result = await handler({ project: "Contoso", backlogId: "Microsoft.FeatureCategory" });
+      expect(result.content[0].text).toBe("Team selection cancelled.");
+    });
+
+    it("my_work_items: should return elicitation response when project selection is declined", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_my_work_items");
+      if (!call) throw new Error("wit_my_work_items not registered");
+      const [, , , handler] = call;
+
+      setupElicitMocks("decline");
+
+      const result = await handler({ type: "assignedtome", top: 50, includeCompleted: false });
+      expect(result.content[0].text).toBe("Project selection cancelled.");
+    });
+
+    it("get_work_items_batch_by_ids: should return elicitation response when project selection is declined", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_get_work_items_batch_by_ids");
+      if (!call) throw new Error("wit_get_work_items_batch_by_ids not registered");
+      const [, , , handler] = call;
+
+      setupElicitMocks("decline");
+
+      const result = await handler({ ids: [1, 2] });
+      expect(result.content[0].text).toBe("Project selection cancelled.");
+    });
+
+    it("get_work_item: should return elicitation response when project selection is declined", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_get_work_item");
+      if (!call) throw new Error("wit_get_work_item not registered");
+      const [, , , handler] = call;
+
+      setupElicitMocks("decline");
+
+      const result = await handler({ id: 1 });
+      expect(result.content[0].text).toBe("Project selection cancelled.");
+    });
+
+    it("list_work_item_comments: should return elicitation response when project selection is declined", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_list_work_item_comments");
+      if (!call) throw new Error("wit_list_work_item_comments not registered");
+      const [, , , handler] = call;
+
+      setupElicitMocks("decline");
+
+      const result = await handler({ workItemId: 1, top: 10 });
+      expect(result.content[0].text).toBe("Project selection cancelled.");
+    });
+
+    it("add_work_item_comment: should return elicitation response when project selection is declined", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_add_work_item_comment");
+      if (!call) throw new Error("wit_add_work_item_comment not registered");
+      const [, , , handler] = call;
+
+      setupElicitMocks("decline");
+
+      const result = await handler({ workItemId: 1, comment: "test comment" });
+      expect(result.content[0].text).toBe("Project selection cancelled.");
+    });
+
+    it("update_work_item_comment: should return elicitation response when project selection is declined", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_update_work_item_comment");
+      if (!call) throw new Error("wit_update_work_item_comment not registered");
+      const [, , , handler] = call;
+
+      setupElicitMocks("decline");
+
+      const result = await handler({ workItemId: 1, commentId: 1, text: "updated text" });
+      expect(result.content[0].text).toBe("Project selection cancelled.");
+    });
+
+    it("list_work_item_revisions: should return elicitation response when project selection is declined", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_list_work_item_revisions");
+      if (!call) throw new Error("wit_list_work_item_revisions not registered");
+      const [, , , handler] = call;
+
+      setupElicitMocks("decline");
+
+      const result = await handler({ workItemId: 1, top: 10 });
+      expect(result.content[0].text).toBe("Project selection cancelled.");
+    });
+
+    it("add_child_work_items: should return elicitation response when project selection is declined", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_add_child_work_items");
+      if (!call) throw new Error("wit_add_child_work_items not registered");
+      const [, , , handler] = call;
+
+      setupElicitMocks("decline");
+
+      const result = await handler({ parentId: 1, workItemType: "Task", items: [{ title: "Child", description: "Desc" }] });
+      expect(result.content[0].text).toBe("Project selection cancelled.");
+    });
+
+    it("get_work_items_for_iteration: should return elicitation response when project selection is declined", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_get_work_items_for_iteration");
+      if (!call) throw new Error("wit_get_work_items_for_iteration not registered");
+      const [, , , handler] = call;
+
+      setupElicitMocks("decline");
+
+      const result = await handler({ iterationId: "iter-1" });
+      expect(result.content[0].text).toBe("Project selection cancelled.");
+    });
+
+    it("get_work_item_type: should return elicitation response when project selection is declined", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_get_work_item_type");
+      if (!call) throw new Error("wit_get_work_item_type not registered");
+      const [, , , handler] = call;
+
+      setupElicitMocks("decline");
+
+      const result = await handler({ workItemType: "Bug" });
+      expect(result.content[0].text).toBe("Project selection cancelled.");
+    });
+
+    it("create_work_item: should return elicitation response when project selection is declined", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_create_work_item");
+      if (!call) throw new Error("wit_create_work_item not registered");
+      const [, , , handler] = call;
+
+      setupElicitMocks("decline");
+
+      const result = await handler({ workItemType: "Task", fields: [{ name: "System.Title", value: "Test" }] });
+      expect(result.content[0].text).toBe("Project selection cancelled.");
+    });
+
+    it("get_query: should return elicitation response when project selection is declined", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_get_query");
+      if (!call) throw new Error("wit_get_query not registered");
+      const [, , , handler] = call;
+
+      setupElicitMocks("decline");
+
+      const result = await handler({ query: "some-query-id", depth: 0, includeDeleted: false, useIsoDateFormat: false });
+      expect(result.content[0].text).toBe("Project selection cancelled.");
+    });
+
+    it("work_items_link: should return elicitation response when project selection is declined", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_work_items_link");
+      if (!call) throw new Error("wit_work_items_link not registered");
+      const [, , , handler] = call;
+
+      setupElicitMocks("decline");
+
+      const result = await handler({ updates: [{ id: 1, linkToId: 2, type: "related" }] });
+      expect(result.content[0].text).toBe("Project selection cancelled.");
+    });
+
+    it("work_item_unlink: should return elicitation response when project selection is declined", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_work_item_unlink");
+      if (!call) throw new Error("wit_work_item_unlink not registered");
+      const [, , , handler] = call;
+
+      setupElicitMocks("decline");
+
+      const result = await handler({ id: 1, type: "related" });
+      expect(result.content[0].text).toBe("Project selection cancelled.");
+    });
+
+    it("add_artifact_link: should return elicitation response when project selection is declined", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_add_artifact_link");
+      if (!call) throw new Error("wit_add_artifact_link not registered");
+      const [, , , handler] = call;
+
+      setupElicitMocks("decline");
+
+      const result = await handler({ workItemId: 1, artifactUri: "vstfs:///Git/Ref/test", linkType: "Branch" });
+      expect(result.content[0].text).toBe("Project selection cancelled.");
+    });
+
+    it("get_work_item_attachment: should return elicitation response when project selection is declined", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_get_work_item_attachment");
+      if (!call) throw new Error("wit_get_work_item_attachment not registered");
+      const [, , , handler] = call;
+
+      setupElicitMocks("decline");
+
+      const result = await handler({ attachmentId: "12341234-1234-1234-1234-123412341234", fileName: "screenshot.png" });
+      expect(result.content[0].text).toBe("Project selection cancelled.");
+    });
+  });
+
+  describe("elicitation accept paths", () => {
+    function setupAcceptMocks(selectedProject = "Contoso", selectedTeam = "Fabrikam") {
+      (mockConnection.getCoreApi as jest.Mock).mockResolvedValue({
+        getProjects: jest.fn().mockResolvedValue([{ id: "proj-1", name: selectedProject }]),
+        getTeams: jest.fn().mockResolvedValue([{ id: "team-1", name: selectedTeam }]),
+      });
+      ((server as unknown as { server: { elicitInput: jest.Mock } }).server.elicitInput as jest.Mock).mockResolvedValue({
+        action: "accept",
+        content: { project: selectedProject, team: selectedTeam },
+      });
+    }
+
+    it("list_backlogs: should use elicited project when project is not provided", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_list_backlogs");
+      if (!call) throw new Error("wit_list_backlogs not registered");
+      const [, , , handler] = call;
+
+      setupAcceptMocks();
+      (mockWorkApi.getBacklogs as jest.Mock).mockResolvedValue([]);
+
+      await handler({ team: "Fabrikam" });
+      expect(mockWorkApi.getBacklogs).toHaveBeenCalledWith({ project: "Contoso", team: "Fabrikam" });
+    });
+
+    it("list_backlogs: should use elicited team when team is not provided", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_list_backlogs");
+      if (!call) throw new Error("wit_list_backlogs not registered");
+      const [, , , handler] = call;
+
+      setupAcceptMocks();
+      (mockWorkApi.getBacklogs as jest.Mock).mockResolvedValue([]);
+
+      await handler({ project: "Contoso" });
+      expect(mockWorkApi.getBacklogs).toHaveBeenCalledWith({ project: "Contoso", team: "Fabrikam" });
+    });
+
+    it("list_backlog_work_items: should use elicited project when project is not provided", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_list_backlog_work_items");
+      if (!call) throw new Error("wit_list_backlog_work_items not registered");
+      const [, , , handler] = call;
+
+      setupAcceptMocks();
+      (mockWorkApi.getBacklogLevelWorkItems as jest.Mock).mockResolvedValue([]);
+
+      await handler({ team: "Fabrikam", backlogId: "Microsoft.FeatureCategory" });
+      expect(mockWorkApi.getBacklogLevelWorkItems).toHaveBeenCalledWith({ project: "Contoso", team: "Fabrikam" }, "Microsoft.FeatureCategory");
+    });
+
+    it("list_backlog_work_items: should use elicited team when team is not provided", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_list_backlog_work_items");
+      if (!call) throw new Error("wit_list_backlog_work_items not registered");
+      const [, , , handler] = call;
+
+      setupAcceptMocks();
+      (mockWorkApi.getBacklogLevelWorkItems as jest.Mock).mockResolvedValue([]);
+
+      await handler({ project: "Contoso", backlogId: "Microsoft.FeatureCategory" });
+      expect(mockWorkApi.getBacklogLevelWorkItems).toHaveBeenCalledWith({ project: "Contoso", team: "Fabrikam" }, "Microsoft.FeatureCategory");
+    });
+
+    it("my_work_items: should use elicited project when project is not provided", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_my_work_items");
+      if (!call) throw new Error("wit_my_work_items not registered");
+      const [, , , handler] = call;
+
+      setupAcceptMocks();
+      (mockWorkApi.getPredefinedQueryResults as jest.Mock).mockResolvedValue([]);
+
+      await handler({ type: "assignedtome", top: 10, includeCompleted: false });
+      expect(mockWorkApi.getPredefinedQueryResults).toHaveBeenCalledWith("Contoso", "assignedtome", 10, false);
+    });
+
+    it("get_work_items_batch_by_ids: should use elicited project when project is not provided", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_get_work_items_batch_by_ids");
+      if (!call) throw new Error("wit_get_work_items_batch_by_ids not registered");
+      const [, , , handler] = call;
+
+      setupAcceptMocks();
+      (mockWorkItemTrackingApi.getWorkItemsBatch as jest.Mock).mockResolvedValue([]);
+
+      await handler({ ids: [1, 2] });
+      expect(mockWorkItemTrackingApi.getWorkItemsBatch).toHaveBeenCalledWith({ ids: [1, 2], fields: expect.any(Array) }, "Contoso");
+    });
+
+    it("get_work_item: should use elicited project when project is not provided", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_get_work_item");
+      if (!call) throw new Error("wit_get_work_item not registered");
+      const [, , , handler] = call;
+
+      setupAcceptMocks();
+      (mockWorkItemTrackingApi.getWorkItem as jest.Mock).mockResolvedValue({ id: 1 });
+
+      await handler({ id: 1 });
+      expect(mockWorkItemTrackingApi.getWorkItem).toHaveBeenCalledWith(1, undefined, undefined, undefined, "Contoso");
+    });
+
+    it("list_work_item_comments: should use elicited project when project is not provided", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_list_work_item_comments");
+      if (!call) throw new Error("wit_list_work_item_comments not registered");
+      const [, , , handler] = call;
+
+      setupAcceptMocks();
+      (mockWorkItemTrackingApi.getComments as jest.Mock).mockResolvedValue([]);
+
+      await handler({ workItemId: 1, top: 10 });
+      expect(mockWorkItemTrackingApi.getComments).toHaveBeenCalledWith("Contoso", 1, 10);
+    });
+
+    it("add_work_item_comment: should use elicited project when project is not provided", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_add_work_item_comment");
+      if (!call) throw new Error("wit_add_work_item_comment not registered");
+      const [, , , handler] = call;
+
+      setupAcceptMocks();
+      mockConnection.serverUrl = "https://dev.azure.com/contoso";
+      (tokenProvider as jest.Mock).mockResolvedValue("fake-token");
+      global.fetch = jest.fn().mockResolvedValue({ ok: true, text: () => Promise.resolve("{}") });
+
+      await handler({ workItemId: 1, comment: "test comment" });
+      const calledUrl = (global.fetch as jest.Mock).mock.calls[0][0] as string;
+      expect(calledUrl).toContain("Contoso");
+    });
+
+    it("update_work_item_comment: should use elicited project when project is not provided", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_update_work_item_comment");
+      if (!call) throw new Error("wit_update_work_item_comment not registered");
+      const [, , , handler] = call;
+
+      setupAcceptMocks();
+      mockConnection.serverUrl = "https://dev.azure.com/contoso";
+      (tokenProvider as jest.Mock).mockResolvedValue("fake-token");
+      global.fetch = jest.fn().mockResolvedValue({ ok: true, text: () => Promise.resolve("{}") });
+
+      await handler({ workItemId: 1, commentId: 1, text: "updated" });
+      const calledUrl = (global.fetch as jest.Mock).mock.calls[0][0] as string;
+      expect(calledUrl).toContain("Contoso");
+    });
+
+    it("list_work_item_revisions: should use elicited project when project is not provided", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_list_work_item_revisions");
+      if (!call) throw new Error("wit_list_work_item_revisions not registered");
+      const [, , , handler] = call;
+
+      setupAcceptMocks();
+      (mockWorkItemTrackingApi.getRevisions as jest.Mock).mockResolvedValue([]);
+
+      await handler({ workItemId: 1, top: 10 });
+      expect(mockWorkItemTrackingApi.getRevisions).toHaveBeenCalledWith(1, 10, undefined, undefined, "Contoso");
+    });
+
+    it("add_child_work_items: should use elicited project when project is not provided", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_add_child_work_items");
+      if (!call) throw new Error("wit_add_child_work_items not registered");
+      const [, , , handler] = call;
+
+      setupAcceptMocks();
+      mockConnection.serverUrl = "https://dev.azure.com/contoso";
+      (tokenProvider as jest.Mock).mockResolvedValue("fake-token");
+      global.fetch = jest.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve({ responses: [] }) });
+
+      await handler({ parentId: 1, workItemType: "Task", items: [{ title: "Child", description: "Desc" }] });
+      const calledBody = JSON.parse((global.fetch as jest.Mock).mock.calls[0][1].body);
+      expect(calledBody[0].uri).toContain("Contoso");
+    });
+
+    it("get_work_items_for_iteration: should use elicited project when project is not provided", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_get_work_items_for_iteration");
+      if (!call) throw new Error("wit_get_work_items_for_iteration not registered");
+      const [, , , handler] = call;
+
+      setupAcceptMocks();
+      (mockWorkApi.getIterationWorkItems as jest.Mock).mockResolvedValue([]);
+
+      await handler({ iterationId: "iter-1" });
+      expect(mockWorkApi.getIterationWorkItems).toHaveBeenCalledWith({ project: "Contoso", team: undefined }, "iter-1");
+    });
+
+    it("get_work_item_type: should use elicited project when project is not provided", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_get_work_item_type");
+      if (!call) throw new Error("wit_get_work_item_type not registered");
+      const [, , , handler] = call;
+
+      setupAcceptMocks();
+      (mockWorkItemTrackingApi.getWorkItemType as jest.Mock).mockResolvedValue({});
+
+      await handler({ workItemType: "Bug" });
+      expect(mockWorkItemTrackingApi.getWorkItemType).toHaveBeenCalledWith("Contoso", "Bug");
+    });
+
+    it("create_work_item: should use elicited project when project is not provided", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_create_work_item");
+      if (!call) throw new Error("wit_create_work_item not registered");
+      const [, , , handler] = call;
+
+      setupAcceptMocks();
+      (mockWorkItemTrackingApi.createWorkItem as jest.Mock).mockResolvedValue({ id: 1 });
+
+      await handler({ workItemType: "Task", fields: [{ name: "System.Title", value: "Test" }] });
+      expect(mockWorkItemTrackingApi.createWorkItem).toHaveBeenCalledWith(null, expect.any(Array), "Contoso", "Task");
+    });
+
+    it("get_query: should use elicited project when project is not provided", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_get_query");
+      if (!call) throw new Error("wit_get_query not registered");
+      const [, , , handler] = call;
+
+      setupAcceptMocks();
+      (mockWorkItemTrackingApi.getQuery as jest.Mock).mockResolvedValue({});
+
+      await handler({ query: "some-query-id", depth: 0, includeDeleted: false, useIsoDateFormat: false });
+      expect(mockWorkItemTrackingApi.getQuery).toHaveBeenCalledWith("Contoso", "some-query-id", undefined, 0, false, false);
+    });
+
+    it("work_items_link: should use elicited project when project is not provided", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_work_items_link");
+      if (!call) throw new Error("wit_work_items_link not registered");
+      const [, , , handler] = call;
+
+      setupAcceptMocks();
+      mockConnection.serverUrl = "https://dev.azure.com/contoso";
+      (tokenProvider as jest.Mock).mockResolvedValue("fake-token");
+      global.fetch = jest.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve([]) });
+
+      await handler({ updates: [{ id: 1, linkToId: 2, type: "related" }] });
+      expect(global.fetch).toHaveBeenCalled();
+    });
+
+    it("work_item_unlink: should use elicited project when project is not provided", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_work_item_unlink");
+      if (!call) throw new Error("wit_work_item_unlink not registered");
+      const [, , , handler] = call;
+
+      setupAcceptMocks();
+      (mockWorkItemTrackingApi.getWorkItem as jest.Mock).mockResolvedValue({ id: 1, relations: [] });
+      (mockWorkItemTrackingApi.updateWorkItem as jest.Mock).mockResolvedValue({ id: 1 });
+
+      await handler({ id: 1, type: "related" });
+      expect(mockWorkItemTrackingApi.getWorkItem).toHaveBeenCalledWith(1, undefined, undefined, 1, "Contoso");
+    });
+
+    it("add_artifact_link: should use elicited project when project is not provided", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_add_artifact_link");
+      if (!call) throw new Error("wit_add_artifact_link not registered");
+      const [, , , handler] = call;
+
+      setupAcceptMocks();
+      (mockWorkItemTrackingApi.updateWorkItem as jest.Mock).mockResolvedValue({ id: 1 });
+
+      await handler({ workItemId: 1, artifactUri: "vstfs:///Git/Ref/test", linkType: "Branch" });
+      expect(mockWorkItemTrackingApi.updateWorkItem).toHaveBeenCalledWith({}, expect.any(Array), 1, "Contoso");
+    });
+
+    it("get_work_item_attachment: should use elicited project when project is not provided", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_get_work_item_attachment");
+      if (!call) throw new Error("wit_get_work_item_attachment not registered");
+      const [, , , handler] = call;
+
+      setupAcceptMocks();
+      const fakeStream = new Readable();
+      fakeStream.push(Buffer.from("data"));
+      fakeStream.push(null);
+      (mockWorkItemTrackingApi.getAttachmentContent as jest.Mock).mockResolvedValue(fakeStream);
+
+      await handler({ attachmentId: "12341234-1234-1234-1234-123412341234", fileName: "screenshot.png" });
+      expect(mockWorkItemTrackingApi.getAttachmentContent).toHaveBeenCalledWith("12341234-1234-1234-1234-123412341234", "screenshot.png", "Contoso");
+    });
+  });
+
+  describe("update_work_item schema transform coverage", () => {
+    it("should apply lowercase transform to the op field via Zod schema", async () => {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_update_work_item");
+      if (!call) throw new Error("wit_update_work_item not registered");
+      const [, , schemaShape] = call;
+
+      // Parse through the Zod schema to trigger the transform callback
+      const { z } = await import("zod");
+      const fullSchema = z.object(schemaShape as Parameters<typeof z.object>[0]);
+      const parsed = fullSchema.parse({
+        id: 1,
+        updates: [{ op: "Replace", path: "/fields/System.Title", value: "test" }],
+      });
+
+      // After the transform, "Replace" should become "replace"
+      expect((parsed as { updates: { op: string }[] }).updates[0].op).toBe("replace");
+    });
+  });
+
+  describe("unknown error type branch coverage", () => {
+    // Helper to get handler for a tool
+    function getHandler(toolName: string) {
+      configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([name]) => name === toolName);
+      if (!call) throw new Error(`${toolName} not registered`);
+      return call[3] as (params: Record<string, unknown>) => Promise<{ content: { text: string }[]; isError?: boolean }>;
+    }
+
+    it("list_backlogs: should return unknown error message for non-Error throws", async () => {
+      const handler = getHandler("wit_list_backlogs");
+      (connectionProvider as jest.Mock).mockRejectedValue("string error");
+      const result = await handler({ project: "P", team: "T" });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe("Error listing backlogs: Unknown error occurred");
+    });
+
+    it("list_backlog_work_items: should return unknown error message for non-Error throws", async () => {
+      const handler = getHandler("wit_list_backlog_work_items");
+      (connectionProvider as jest.Mock).mockRejectedValue("string error");
+      const result = await handler({ project: "P", team: "T", backlogId: "B" });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe("Error listing backlog work items: Unknown error occurred");
+    });
+
+    it("my_work_items: should return unknown error message for non-Error throws", async () => {
+      const handler = getHandler("wit_my_work_items");
+      (connectionProvider as jest.Mock).mockRejectedValue("string error");
+      const result = await handler({ project: "P", type: "assignedtome", top: 10, includeCompleted: false });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe("Error retrieving work items: Unknown error occurred");
+    });
+
+    it("get_work_items_batch_by_ids: should return unknown error message for non-Error throws", async () => {
+      const handler = getHandler("wit_get_work_items_batch_by_ids");
+      (connectionProvider as jest.Mock).mockRejectedValue("string error");
+      const result = await handler({ project: "P", ids: [1] });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe("Error retrieving work items batch: Unknown error occurred");
+    });
+
+    it("get_work_item: should return unknown error message for non-Error throws", async () => {
+      const handler = getHandler("wit_get_work_item");
+      (connectionProvider as jest.Mock).mockRejectedValue("string error");
+      const result = await handler({ id: 1, project: "P" });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe("Error retrieving work item: Unknown error occurred");
+    });
+
+    it("list_work_item_comments: should return unknown error message for non-Error throws", async () => {
+      const handler = getHandler("wit_list_work_item_comments");
+      (connectionProvider as jest.Mock).mockRejectedValue("string error");
+      const result = await handler({ project: "P", workItemId: 1, top: 10 });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe("Error listing work item comments: Unknown error occurred");
+    });
+
+    it("add_work_item_comment: should return unknown error message for non-Error throws", async () => {
+      const handler = getHandler("wit_add_work_item_comment");
+      (connectionProvider as jest.Mock).mockRejectedValue("string error");
+      const result = await handler({ project: "P", workItemId: 1, comment: "test" });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe("Error adding work item comment: Unknown error occurred");
+    });
+
+    it("update_work_item_comment: should return unknown error message for non-Error throws", async () => {
+      const handler = getHandler("wit_update_work_item_comment");
+      (connectionProvider as jest.Mock).mockRejectedValue("string error");
+      const result = await handler({ project: "P", workItemId: 1, commentId: 1, text: "updated" });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe("Error updating work item comment: Unknown error occurred");
+    });
+
+    it("update_work_item_comment: should use format=0 when format is markdown", async () => {
+      const handler = getHandler("wit_update_work_item_comment");
+      mockConnection.serverUrl = "https://dev.azure.com/contoso";
+      (tokenProvider as jest.Mock).mockResolvedValue("fake-token");
+      global.fetch = jest.fn().mockResolvedValue({ ok: true, text: () => Promise.resolve("{}") });
+
+      await handler({ project: "P", workItemId: 1, commentId: 1, text: "updated", format: "Markdown" });
+      const calledUrl = (global.fetch as jest.Mock).mock.calls[0][0] as string;
+      expect(calledUrl).toContain("format=0");
+    });
+
+    it("update_work_item_comment: should use format=1 when format is Html", async () => {
+      const handler = getHandler("wit_update_work_item_comment");
+      mockConnection.serverUrl = "https://dev.azure.com/contoso";
+      (tokenProvider as jest.Mock).mockResolvedValue("fake-token");
+      global.fetch = jest.fn().mockResolvedValue({ ok: true, text: () => Promise.resolve("{}") });
+
+      await handler({ project: "P", workItemId: 1, commentId: 1, text: "updated", format: "Html" });
+      const calledUrl = (global.fetch as jest.Mock).mock.calls[0][0] as string;
+      expect(calledUrl).toContain("format=1");
+    });
+
+    it("list_work_item_revisions: should return unknown error message for non-Error throws", async () => {
+      const handler = getHandler("wit_list_work_item_revisions");
+      (connectionProvider as jest.Mock).mockRejectedValue("string error");
+      const result = await handler({ project: "P", workItemId: 1, top: 10 });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe("Error listing work item revisions: Unknown error occurred");
+    });
+
+    it("list_work_item_revisions: should handle null revisions without errors", async () => {
+      const handler = getHandler("wit_list_work_item_revisions");
+      (mockWorkItemTrackingApi.getRevisions as jest.Mock).mockResolvedValue(null);
+      const result = await handler({ project: "P", workItemId: 1, top: 10 });
+      expect(result.content[0].text).toBe(JSON.stringify(null, null, 2));
+    });
+
+    it("get_work_items_for_iteration: should return unknown error message for non-Error throws", async () => {
+      const handler = getHandler("wit_get_work_items_for_iteration");
+      (connectionProvider as jest.Mock).mockRejectedValue("string error");
+      const result = await handler({ project: "P", iterationId: "iter-1" });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe("Error retrieving work items for iteration: Unknown error occurred");
+    });
+
+    it("update_work_item: should return unknown error message for non-Error throws", async () => {
+      const handler = getHandler("wit_update_work_item");
+      (mockWorkItemTrackingApi.updateWorkItem as jest.Mock).mockRejectedValue("string error");
+      const result = await handler({ id: 1, updates: [{ op: "add", path: "/fields/System.Title", value: "T" }] });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe("Error updating work item: Unknown error occurred");
+    });
+
+    it("get_work_item_type: should return unknown error message for non-Error throws", async () => {
+      const handler = getHandler("wit_get_work_item_type");
+      (mockWorkItemTrackingApi.getWorkItemType as jest.Mock).mockRejectedValue("string error");
+      const result = await handler({ project: "P", workItemType: "Bug" });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe("Error retrieving work item type: Unknown error occurred");
+    });
+
+    it("get_query: should return unknown error message for non-Error throws", async () => {
+      const handler = getHandler("wit_get_query");
+      (mockWorkItemTrackingApi.getQuery as jest.Mock).mockRejectedValue("string error");
+      const result = await handler({ project: "P", query: "q", depth: 0, includeDeleted: false, useIsoDateFormat: false });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe("Error retrieving query: Unknown error occurred");
+    });
+
+    it("get_query_results_by_id: should return unknown error message for non-Error throws", async () => {
+      const handler = getHandler("wit_get_query_results_by_id");
+      (mockWorkItemTrackingApi.queryById as jest.Mock).mockRejectedValue("string error");
+      const result = await handler({ id: "q-id", project: "P", top: 10 });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe("Error retrieving query results: Unknown error occurred");
+    });
+
+    it("get_query_results_by_id: should handle null workItems in ids mode", async () => {
+      const handler = getHandler("wit_get_query_results_by_id");
+      (mockWorkItemTrackingApi.queryById as jest.Mock).mockResolvedValue({ workItems: null });
+      const result = await handler({ id: "q-id", project: "P", responseType: "ids", top: 50 });
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.ids).toEqual([]);
+      expect(parsed.count).toBe(0);
+    });
+
+    it("update_work_items_batch: should return unknown error message for non-Error throws", async () => {
+      const handler = getHandler("wit_update_work_items_batch");
+      (connectionProvider as jest.Mock).mockRejectedValue("string error");
+      const result = await handler({ updates: [{ op: "replace", id: 1, path: "/fields/System.Title", value: "T" }] });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe("Error updating work items in batch: Unknown error occurred");
+    });
+
+    it("work_items_link: should return unknown error message for non-Error throws", async () => {
+      const handler = getHandler("wit_work_items_link");
+      (connectionProvider as jest.Mock).mockRejectedValue("string error");
+      const result = await handler({ project: "P", updates: [{ id: 1, linkToId: 2, type: "related" }] });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe("Error linking work items: Unknown error occurred");
+    });
+
+    it("get_work_item_attachment: should return unknown error message for non-Error throws", async () => {
+      const handler = getHandler("wit_get_work_item_attachment");
+      (mockWorkItemTrackingApi.getAttachmentContent as jest.Mock).mockRejectedValue("string error");
+      const result = await handler({ project: "P", attachmentId: "att-id" });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe("Error retrieving work item attachment: Unknown error occurred");
+    });
+
+    it("query_by_wiql: should return unknown error message for non-Error throws", async () => {
+      const handler = getHandler("wit_query_by_wiql");
+      (mockWorkItemTrackingApi.queryByWiql as jest.Mock).mockRejectedValue("string error");
+      const result = await handler({ wiql: "SELECT [System.Id] FROM WorkItems", project: "P", top: 50 });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe("Error executing WIQL query: Unknown error occurred");
+    });
+
+    it("list_work_item_revisions: should handle revision without fields property", async () => {
+      const handler = getHandler("wit_list_work_item_revisions");
+      const revisionsWithNoFields = [
+        { id: 1, rev: 1 }, // no fields property
+        { id: 2, rev: 2, fields: { "System.Title": "Test" } },
+      ];
+      (mockWorkItemTrackingApi.getRevisions as jest.Mock).mockResolvedValue(revisionsWithNoFields);
+      const result = await handler({ project: "P", workItemId: 1, top: 10 });
+      expect(result.content[0].text).toBe(JSON.stringify(revisionsWithNoFields, null, 2));
     });
   });
 });

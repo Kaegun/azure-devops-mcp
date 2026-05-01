@@ -53,5 +53,7 @@ module.exports = {
     "^(.+)/logger\\.js$": "$1/logger.ts",
     "^(.+)/organization-context\\.js$": "$1/organization-context.ts",
     "^(.+)/tool-wrapper\\.js$": "$1/tool-wrapper.ts",
+    "^(.+)/elicitations\\.js$": "$1/elicitations.ts",
+    "^(.+)/content-safety\\.js$": "$1/content-safety.ts",
   },
 };

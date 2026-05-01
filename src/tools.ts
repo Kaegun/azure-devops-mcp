@@ -12,6 +12,7 @@ import { OAuthAuthenticator } from "./auth.js";
 import { logger } from "./logger.js";
 import { packageVersion } from "./version.js";
 import { configureAdvSecTools } from "./tools/advanced-security.js";
+import { configureMcpAppsTools } from "./tools/mcp-apps.js";
 import { configurePipelineTools } from "./tools/pipelines.js";
 import { configureCoreTools } from "./tools/core.js";
 import { configureRepoTools } from "./tools/repositories.js";
@@ -416,104 +417,34 @@ function configureOrgManagementTools(server: McpServer, orgManager: Organization
   );
 }
 
-/**
- * Configure all tools with organization-aware functionality
- */
-function configureAllTools(server: McpServer, orgManager: OrganizationManager) {
-  // Add organization management tools first
+function configureAllTools(
+  server: McpServer,
+  tokenProvider: () => Promise<string>,
+  connectionProvider: () => Promise<WebApi>,
+  userAgentProvider: () => string,
+  enabledDomains: Set<string>,
+  orgManager: OrganizationManager
+) {
+  // Multi-org management tools (switch_organization, list_organizations, etc.) — registered
+  // unconditionally so they're available regardless of which domains are enabled.
   configureOrgManagementTools(server, orgManager);
 
-  // Configure domain tools with backward compatibility for now
-  // As we update each domain's tools, we'll switch to context-aware versions
-  configureDomainToolsWithBackwardCompatibility(server, orgManager);
-}
+  const configureIfDomainEnabled = (domain: string, configureFn: () => void) => {
+    if (enabledDomains.has(domain)) {
+      configureFn();
+    }
+  };
 
-/**
- * Configure domain tools with backward compatibility
- * This allows tools to work in both single-org and multi-org modes
- */
-function configureDomainToolsWithBackwardCompatibility(server: McpServer, orgManager: OrganizationManager) {
-  // For now, use the legacy approach but with context providers
-  // Each domain will be updated individually to use withOrganizationContext
-
-  // Core tools - always configure as they're needed for identity
-  configureCoreTools(
-    server,
-    () => getCurrentOrgTokenProvider(orgManager),
-    () => getCurrentOrgConnectionProvider(orgManager),
-    () => getCurrentOrgUserAgent(orgManager)
-  );
-
-  // Other domains - configure with legacy approach for now
-  configureWorkTools(
-    server,
-    () => getCurrentOrgTokenProvider(orgManager),
-    () => getCurrentOrgConnectionProvider(orgManager)
-  );
-  configurePipelineTools(
-    server,
-    () => getCurrentOrgTokenProvider(orgManager),
-    () => getCurrentOrgConnectionProvider(orgManager),
-    () => getCurrentOrgUserAgent(orgManager)
-  );
-  configureRepoTools(
-    server,
-    () => getCurrentOrgTokenProvider(orgManager),
-    () => getCurrentOrgConnectionProvider(orgManager),
-    () => getCurrentOrgUserAgent(orgManager)
-  );
-  configureWorkItemTools(
-    server,
-    () => getCurrentOrgTokenProvider(orgManager),
-    () => getCurrentOrgConnectionProvider(orgManager),
-    () => getCurrentOrgUserAgent(orgManager)
-  );
-  configureWikiTools(
-    server,
-    () => getCurrentOrgTokenProvider(orgManager),
-    () => getCurrentOrgConnectionProvider(orgManager),
-    () => getCurrentOrgUserAgent(orgManager)
-  );
-  configureTestPlanTools(
-    server,
-    () => getCurrentOrgTokenProvider(orgManager),
-    () => getCurrentOrgConnectionProvider(orgManager)
-  );
-  configureSearchTools(
-    server,
-    () => getCurrentOrgTokenProvider(orgManager),
-    () => getCurrentOrgConnectionProvider(orgManager),
-    () => getCurrentOrgUserAgent(orgManager)
-  );
-  configureAdvSecTools(
-    server,
-    () => getCurrentOrgTokenProvider(orgManager),
-    () => getCurrentOrgConnectionProvider(orgManager)
-  );
-}
-
-/**
- * Helper functions to bridge organization context with legacy tool interfaces
- */
-function getCurrentOrgTokenProvider(orgManager: OrganizationManager): Promise<string> {
-  const context = orgManager.getCurrentContext();
-  if (!context) {
-    throw new Error("No organization context available");
-  }
-  return context.authenticator();
-}
-
-function getCurrentOrgConnectionProvider(orgManager: OrganizationManager): Promise<any> {
-  const context = orgManager.getCurrentContext();
-  if (!context) {
-    throw new Error("No organization context available");
-  }
-  return context.connectionProvider();
-}
-
-function getCurrentOrgUserAgent(orgManager: OrganizationManager): string {
-  // Return a default user agent - this will be properly handled by organization context
-  return "AzureDevOps.MCP";
+  configureIfDomainEnabled(Domain.CORE, () => configureCoreTools(server, tokenProvider, connectionProvider, userAgentProvider));
+  configureIfDomainEnabled(Domain.MCP_APPS, () => configureMcpAppsTools(server));
+  configureIfDomainEnabled(Domain.WORK, () => configureWorkTools(server, tokenProvider, connectionProvider));
+  configureIfDomainEnabled(Domain.PIPELINES, () => configurePipelineTools(server, tokenProvider, connectionProvider, userAgentProvider));
+  configureIfDomainEnabled(Domain.REPOSITORIES, () => configureRepoTools(server, tokenProvider, connectionProvider, userAgentProvider));
+  configureIfDomainEnabled(Domain.WORK_ITEMS, () => configureWorkItemTools(server, tokenProvider, connectionProvider, userAgentProvider));
+  configureIfDomainEnabled(Domain.WIKI, () => configureWikiTools(server, tokenProvider, connectionProvider, userAgentProvider));
+  configureIfDomainEnabled(Domain.TEST_PLANS, () => configureTestPlanTools(server, tokenProvider, connectionProvider, userAgentProvider));
+  configureIfDomainEnabled(Domain.SEARCH, () => configureSearchTools(server, tokenProvider, connectionProvider, userAgentProvider));
+  configureIfDomainEnabled(Domain.ADVANCED_SECURITY, () => configureAdvSecTools(server, tokenProvider, connectionProvider));
 }
 
 export { configureAllTools };
